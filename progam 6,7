@@ -1,0 +1,147 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class RBM(nn.Module):
+    def __init__(self, n_vis, n_hid, gaussian=False):
+        super(RBM, self).__init__()
+        self.W = nn.Parameter(torch.randn(n_hid, n_vis) * 0.01)
+        self.h_bias = nn.Parameter(torch.zeros(n_hid))
+        self.v_bias = nn.Parameter(torch.zeros(n_vis))
+        self.gaussian = gaussian
+
+    def sample_h(self, v):
+        v = v.to(self.W.device)
+        prob = torch.sigmoid(torch.matmul(v, self.W.t()) + self.h_bias)
+        prob = torch.clamp(prob, 0.0, 1.0)
+        prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
+        return prob, torch.bernoulli(prob)
+
+    def sample_v(self, h):
+        h = h.to(self.W.device)
+        activation = torch.matmul(h, self.W) + self.v_bias
+        if self.gaussian:
+            return activation, activation
+        else:
+            prob = torch.sigmoid(activation)
+            prob = torch.clamp(prob, 0.0, 1.0)
+            prob = torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0)
+            return prob, torch.bernoulli(prob)
+
+    def contrastive_divergence(self, v, k=1):
+        v0 = v
+        ph0, h0 = self.sample_h(v0)
+        vk = v0
+        for _ in range(k):
+            _, hk = self.sample_h(vk)
+            _, vk = self.sample_v(hk)
+        phk, _ = self.sample_h(vk)
+        self.W.grad = -(torch.matmul(ph0.t(), v0) - torch.matmul(phk.t(), vk))
+        self.v_bias.grad = -(v0 - vk).sum(0)
+        self.h_bias.grad = -(ph0 - phk).sum(0)
+        return torch.mean((v0 - vk) ** 2)
+
+class DBN(nn.Module):
+    def __init__(self, layers):
+        super(DBN, self).__init__()
+        self.rbm_layers = nn.ModuleList([
+            RBM(layers[i], layers[i+1]) for i in range(len(layers)-1)
+        ])
+        self.classifier = nn.Sequential(
+            nn.Linear(layers[-1], 10)
+        )
+
+    def forward(self, x):
+        for rbm in self.rbm_layers:
+            x, _ = rbm.sample_h(x)
+        return self.classifier(x)
+
+    def pretrain(self, train_loader, epochs=5):
+        input_data = None
+        for i, rbm in enumerate(self.rbm_layers):
+            optimizer = optim.SGD(rbm.parameters(), lr=0.1)
+            for epoch in range(epochs):
+                loss_ = 0
+                for batch, _ in train_loader:
+                    batch = batch.view(batch.size(0), -1).to(device)
+                    if input_data is not None:
+                        batch, _ = input_data.sample_h(batch)
+                    optimizer.zero_grad()
+                    loss = rbm.contrastive_divergence(batch, k=1)
+                    for param in rbm.parameters():
+                        param.grad /= batch.size(0)
+                    optimizer.step()
+                    loss_ += loss.item()
+                print(f"DBN RBM {i+1} Epoch {epoch+1}: Loss = {loss_:.4f}")
+            input_data = rbm
+
+    def finetune(self, train_loader, test_loader, epochs=10):
+        optimizer = optim.Adam(self.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+        for epoch in range(epochs):
+            self.train()
+            for batch, target in train_loader:
+                batch = batch.view(batch.size(0), -1).to(device)
+                target = target.to(device)
+                optimizer.zero_grad()
+                output = self.forward(batch)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+            self.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for batch, target in test_loader:
+                    batch = batch.view(batch.size(0), -1).to(device)
+                    target = target.to(device)
+                    output = self.forward(batch)
+                    pred = output.argmax(dim=1)
+                    correct += (pred == target).sum().item()
+                    total += target.size(0)
+            print(f"Epoch {epoch+1}: Accuracy = {100 * correct / total:.2f}%")
+
+transform = transforms.Compose([transforms.ToTensor()])
+train_dataset = datasets.FashionMNIST(root=".", train=True, download=True, transform=transform)
+test_dataset = datasets.FashionMNIST(root=".", train=False, download=True, transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+print("\n=== Pretraining DBN ===")
+dbn = DBN([784, 256, 128]).to(device)
+dbn.pretrain(train_loader)
+
+print("\n=== Fine-tuning DBN ===")
+dbn.finetune(train_loader, test_loader)
+
+print("\n=== Training DBM-style stacked RBMs ===")
+dbm_rbm1 = RBM(784, 256, gaussian=True).to(device)
+dbm_rbm2 = RBM(256, 128).to(device)
+optimizer1 = optim.SGD(dbm_rbm1.parameters(), lr=0.01)
+optimizer2 = optim.SGD(dbm_rbm2.parameters(), lr=0.01)
+
+for epoch in range(5):
+    for batch, _ in train_loader:
+        batch = batch[0].view(batch[0].size(0), -1).to(device)
+        optimizer1.zero_grad()
+        loss = dbm_rbm1.contrastive_divergence(batch, k=1)
+        for param in dbm_rbm1.parameters():
+            param.grad /= batch.size(0)
+        optimizer1.step()
+    print(f"DBM RBM 1 Epoch {epoch+1}: Loss = {loss:.4f}")
+
+for epoch in range(5):
+    for batch, _ in train_loader:
+        batch = batch[0].view(batch[0].size(0), -1).to(device)
+        _, h = dbm_rbm1.sample_h(batch)
+        optimizer2.zero_grad()
+        loss = dbm_rbm2.contrastive_divergence(h, k=1)
+        for param in dbm_rbm2.parameters():
+            param.grad /= batch.size(0)
+        optimizer2.step()
+    print(f"DBM RBM 2 Epoch {epoch+1}: Loss = {loss:.4f}")
